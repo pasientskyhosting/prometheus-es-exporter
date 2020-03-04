@@ -1,23 +1,25 @@
-import click
 import configparser
 import glob
 import json
 import logging
 import os
 import sched
+import threading
 import time
 
+import click
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionTimeout
+from flask import Flask
 from jog import JogFormatter
-from prometheus_client import start_http_server
-from prometheus_client.core import GaugeMetricFamily, REGISTRY
+from prometheus_client import MetricsHandler, make_wsgi_app
+from prometheus_client.core import REGISTRY, GaugeMetricFamily
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from werkzeug.serving import run_simple
 
-from . import cluster_health_parser
-from . import indices_stats_parser
-from . import nodes_stats_parser
-from .metrics import (group_metrics, gauge_generator,
-                      format_metric_name, merge_metric_dicts)
+from . import cluster_health_parser, indices_stats_parser, nodes_stats_parser
+from .metrics import (format_metric_name, gauge_generator, group_metrics,
+                      merge_metric_dicts)
 from .parser import parse_response
 from .scheduler import schedule_job
 from .utils import log_exceptions, nice_shutdown
@@ -29,6 +31,29 @@ CONTEXT_SETTINGS = {
 }
 
 METRICS_BY_QUERY = {}
+
+# Create my app
+app = Flask(__name__)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+log = logging.getLogger('elasticsearch')
+log.setLevel(logging.WARNING)
+
+
+@app.route('/')
+def home():
+    return '''<html>
+              <head><title>Elasticsearch Query Exporter</title></head>
+              <body>
+              <h1>Elasticsearch Query Exporter</h1>
+              <p><a href="/metrics">Metrics</a></p>
+              </body>
+              </html>'''
+
+
+@app.route('/health')
+def liveness():
+    return "Yes"
 
 
 def collector_up_gauge(name_list, description, succeeded=True):
@@ -48,9 +73,11 @@ class ClusterHealthCollector(object):
 
     def collect(self):
         try:
-            response = self.es_client.cluster.health(level=self.level, request_timeout=self.timeout)
+            response = self.es_client.cluster.health(
+                level=self.level, request_timeout=self.timeout)
 
-            metrics = cluster_health_parser.parse_response(response, self.metric_name_list)
+            metrics = cluster_health_parser.parse_response(
+                response, self.metric_name_list)
             metric_dict = group_metrics(metrics)
         except ConnectionTimeout:
             log.warning('Timeout while fetching %(description)s (timeout %(timeout_s)ss).',
@@ -76,9 +103,11 @@ class NodesStatsCollector(object):
 
     def collect(self):
         try:
-            response = self.es_client.nodes.stats(metric=self.metrics, request_timeout=self.timeout)
+            response = self.es_client.nodes.stats(
+                metric=self.metrics, request_timeout=self.timeout)
 
-            metrics = nodes_stats_parser.parse_response(response, self.metric_name_list)
+            metrics = nodes_stats_parser.parse_response(
+                response, self.metric_name_list)
             metric_dict = group_metrics(metrics)
         except ConnectionTimeout:
             log.warning('Timeout while fetching %(description)s (timeout %(timeout_s)ss).',
@@ -106,9 +135,11 @@ class IndicesStatsCollector(object):
 
     def collect(self):
         try:
-            response = self.es_client.indices.stats(metric=self.metrics, fields=self.fields, request_timeout=self.timeout)
+            response = self.es_client.indices.stats(
+                metric=self.metrics, fields=self.fields, request_timeout=self.timeout)
 
-            metrics = indices_stats_parser.parse_response(response, self.parse_indices, self.metric_name_list)
+            metrics = indices_stats_parser.parse_response(
+                response, self.parse_indices, self.metric_name_list)
             metric_dict = group_metrics(metrics)
         except ConnectionTimeout:
             log.warning('Timeout while fetching %(description)s (timeout %(timeout_s)ss).',
@@ -139,7 +170,8 @@ def run_query(es_client, query_name, indices, query,
               timeout, on_error, on_missing):
 
     try:
-        response = es_client.search(index=indices, body=query, request_timeout=timeout)
+        response = es_client.search(
+            index=indices, body=query, request_timeout=timeout)
 
         metrics = parse_response(response, [query_name])
         metric_dict = group_metrics(metrics)
@@ -388,7 +420,8 @@ CONFIGPARSER_CONVERTERS = {
 @click.option('--json-logging', '-j', default=False, is_flag=True,
               help='Turn on json logging.')
 @click.option('--log-level', default='INFO',
-              type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']),
+              type=click.Choice(
+                  ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']),
               help='Detail level to log. (default: INFO)')
 @click.option('--verbose', '-v', default=False, is_flag=True,
               help='Turn on verbose (DEBUG) logging. Overrides --log-level.')
@@ -396,26 +429,33 @@ def cli(**options):
     """Export Elasticsearch query results to Prometheus."""
 
     if options['basic_user'] and options['basic_password'] is None:
-        click.BadOptionUsage('basic_user', 'Username provided with no password.')
+        click.BadOptionUsage(
+            'basic_user', 'Username provided with no password.')
     elif options['basic_user'] is None and options['basic_password']:
-        click.BadOptionUsage('basic_password', 'Password provided with no username.')
+        click.BadOptionUsage(
+            'basic_password', 'Password provided with no username.')
     elif options['basic_user']:
         http_auth = (options['basic_user'], options['basic_password'])
     else:
         http_auth = None
 
     if not options['ca_certs'] and options['client_cert']:
-        click.BadOptionUsage('client_cert', '--client-cert can only be used when --ca-certs is provided.')
+        click.BadOptionUsage(
+            'client_cert', '--client-cert can only be used when --ca-certs is provided.')
     elif not options['ca_certs'] and options['client_key']:
-        click.BadOptionUsage('client_key', '--client-key can only be used when --ca-certs is provided.')
+        click.BadOptionUsage(
+            'client_key', '--client-key can only be used when --ca-certs is provided.')
     elif options['client_cert'] and not options['client_key']:
-        click.BadOptionUsage('client_cert', '--client-key must be provided when --client-cert is used.')
+        click.BadOptionUsage(
+            'client_cert', '--client-key must be provided when --client-cert is used.')
     elif not options['client_cert'] and options['client_key']:
-        click.BadOptionUsage('client_key', '--client-cert must be provided when --client-key is used.')
+        click.BadOptionUsage(
+            'client_key', '--client-cert must be provided when --client-key is used.')
 
     log_handler = logging.StreamHandler()
     log_format = '[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s'
-    formatter = JogFormatter(log_format) if options['json_logging'] else logging.Formatter(log_format)
+    formatter = JogFormatter(
+        log_format) if options['json_logging'] else logging.Formatter(log_format)
     log_handler.setFormatter(formatter)
 
     log_level = getattr(logging, options['log_level'])
@@ -503,7 +543,12 @@ def cli(**options):
         REGISTRY.register(QueryMetricCollector())
 
     log.info('Starting server...')
-    start_http_server(port)
+    # start_http_server(port)
+    app_dispatch = DispatcherMiddleware(app, {
+        '/metrics': make_wsgi_app()
+    })
+    threading.Thread(target=run_simple, args=('0.0.0.0', port, app_dispatch,), kwargs={
+                     'use_reloader': False, 'use_debugger': False, 'use_evalex': True}, daemon=True).start()
     log.info('Server started on port %(port)s', {'port': port})
 
     if scheduler:

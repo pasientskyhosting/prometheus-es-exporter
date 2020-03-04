@@ -1,10 +1,10 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 setup(
     name='prometheus-es-exporter',
     version='0.7.0',
     description='Elasticsearch query Prometheus exporter',
-    url='https://github.com/braedon/prometheus-es-exporter',
+    url='https://github.com/pasientskyhosting/prometheus-es-exporter',
     author='Braedon Vickers',
     author_email='braedon.vickers@gmail.com',
     license='MIT',
@@ -27,6 +27,7 @@ setup(
         'elasticsearch',
         'jog',
         'prometheus-client >= 0.6.0',
+        'flask',
     ],
     entry_points={
         'console_scripts': [
